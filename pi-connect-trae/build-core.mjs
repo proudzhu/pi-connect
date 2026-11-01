@@ -5,6 +5,7 @@
 // 4. Patch refreshNow's atomic write to plain fs
 // 4e. Drop the per-request debug dump
 // 4f. Report a partially discovered SOLO directory instead of throwing
+// 4g. Enterprise (企业版) Trae CN gateway, request ids, upstream error frames
 // 5. Keep only protocol core (1-3111); strip usage/web-status/DSH entry
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -38,7 +39,7 @@ import { createServer } from "node:http";
 import { Readable } from "node:stream";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 `;
 
 // Find the line where "#region src/catalog.ts" starts (currently line 17)
@@ -271,6 +272,231 @@ const FETCH_REPLACEMENT = [
 if (text.split(FETCH_ANCHOR).length !== 2) throw new Error("SOLO fetchModels anchor not unique");
 text = text.replace(FETCH_ANCHOR, FETCH_REPLACEMENT);
 
+// --- 4g. Enterprise (企业版) Trae CN gateway, request ids, error frames ---
+// An enterprise (tenant) Trae CN seat does not bill through the public gateway.
+// The tenant install's login response carries `HostInfo` with the tenant hosts,
+// while `trae-api-cn.mchost.guru` only ever sees the personal credit packs —
+// empty for an enterprise seat, so it answers every request with
+// `event:error {"code":4008,"message":"Your requests have exceeded the quota."}`.
+// The tenant host is therefore resolved at import time (env override → newest
+// IDE `main.log` → remembered host → public gateway, which keeps personal
+// accounts exactly as they were) and written over `REGION_GATEWAYS.cn`.
+//
+// The same gateway rejects a SOLO body without `request_id`/`session_id`
+// (`4001 "param is invalid"`; the public gateway does not care), and an
+// upstream error must leave the bridge stream as an OpenAI-style error frame
+// rather than `controller.error()` — in Bun that surfaces as an unhandled
+// rejection and takes the whole Pi process down instead of reporting a model
+// error.
+const ENT_REGION_ANCHOR = '\t\tpay: "https://growsg-normal.trae.ai"\n\t}\n};';
+if (text.split(ENT_REGION_ANCHOR).length !== 2) throw new Error("REGION_GATEWAYS ai block not found");
+const ENT_GATEWAY_BLOCK = `/**
+* Enterprise (企业版) Trae CN tenants do not bill through the public gateway.
+*
+* The tenant install's login response carries \`HostInfo\` with the tenant hosts —
+* observed on a real enterprise tenant (productType 230) as \`Api\`/\`Core\`/\`Console\` =
+* https://console.enterprise.trae.cn and \`SoloDomain\` =
+* https://work.enterprise.trae.cn. That gateway is what serves the enterprise
+* roster and bills the enterprise quota. The public \`trae-api-cn.mchost.guru\`
+* only ever sees the personal credit packs, which are empty for an enterprise
+* seat, so it answers with
+* \`event:error {"code":4008,"message":"Your requests have exceeded the quota."}\`
+* however much quota the enterprise console shows.
+*
+* Resolved at import time from, in order: the \`PI_TRAE_CN_CHAT_BASE\` env var, the
+* newest Trae CN IDE \`main.log\` \`"HostInfo"\` block, the remembered host (so a
+* rotated or cleaned log cannot silently put an enterprise seat back on the
+* public gateway), and finally the public gateway — personal accounts are
+* untouched.
+*/
+const TRAE_CN_ENTERPRISE_HOST_RE = /enterprise\\.trae\\.(?:cn|com)/i;
+/** Probe order: the hosts the IDE itself sends API traffic to come first. */
+const TRAE_CN_ENTERPRISE_HOST_KEYS = ["Api", "Core", "Console", "SoloDomain"];
+/** Newest log sessions to read; older ones may predate the account switch. */
+const TRAE_CN_LOG_SESSION_LIMIT = 4;
+/** Session directory name: \`YYYYMMDDThhmmss\`, written once per IDE start. */
+const TRAE_CN_LOG_SESSION_RE = /^\\d{8}T\\d{6}$/;
+/** Remembers the detected tenant host across starts. */
+function traeCnGatewayCachePath() {
+\treturn join(homedir(), ".pi", "agent", "cache", "dsh-connect-trae", "gateway-cn.json");
+}
+/**
+* Trae CN install roots to look for logs under, derived from the storage
+* candidates so that the enterprise probe and the credential scanner agree on
+* which installation they describe (same edition, same directory spellings,
+* same platform rules).
+*/
+function traeCnInstallRoots() {
+\tconst roots = [];
+\tfor (const candidate of traeStorageCandidates()) {
+\t\tif (candidate.source !== "desktop" || candidate.edition !== "cn") continue;
+\t\tconst root = dirname(dirname(dirname(candidate.path)));
+\t\tif (!roots.includes(root)) roots.push(root);
+\t}
+\treturn roots;
+}
+/**
+* Newest Trae CN log sessions, newest first.
+*
+* The IDE writes one directory per session (\`logs/<ISO-ish start stamp>/\`), so
+* the newest name is also the "generation" of the log: a login — and therefore
+* any tenant switch — writes a fresh \`HostInfo\` into the session that is
+* starting, which is a new directory.
+*/
+function traeCnLogSessions() {
+\tconst sessions = [];
+\tfor (const root of traeCnInstallRoots()) {
+\t\tlet names;
+\t\ttry {
+\t\t\tnames = readdirSync(join(root, "logs")).sort().reverse();
+\t\t} catch {
+\t\t\tcontinue;
+\t\t}
+\t\t// \`logs/\` also holds non-session entries (the IDE's \`aha_log\` telemetry
+\t\t// directory, ad-hoc dumps). Prefer the session stamps; if an installer ever
+\t\t// renames them, fall back to plain name order rather than reporting no
+\t\t// sessions at all.
+\t\tconst stamped = names.filter((name) => TRAE_CN_LOG_SESSION_RE.test(name));
+\t\tfor (const name of (stamped.length > 0 ? stamped : names).slice(0, TRAE_CN_LOG_SESSION_LIMIT)) sessions.push({
+\t\t\troot,
+\t\t\tname,
+\t\t\tmainLog: join(root, "logs", name, "main.log")
+\t\t});
+\t}
+\treturn sessions;
+}
+/** Enterprise host named by the last \`"HostInfo"\` block of one log, if any. */
+function traeCnHostInfoHost(text) {
+\tconst at = text.lastIndexOf('"HostInfo"');
+\tif (at === -1) return void 0;
+\t// \`HostInfo\` is one dense JSON blob; 4 KiB past its key always covers the
+\t// host fields above the AB/APM telemetry sub-objects.
+\tconst chunk = text.slice(at, at + 4e3);
+\tfor (const key of TRAE_CN_ENTERPRISE_HOST_KEYS) {
+\t\tconst host = new RegExp(\`"\${key}":"(https?:\\\\/\\\\/[^"]+)"\`).exec(chunk)?.[1];
+\t\tif (typeof host === "string" && TRAE_CN_ENTERPRISE_HOST_RE.test(host)) return host.replace(/\\/+$/, "");
+\t}
+}
+function readTraeCnGatewayCache(cachePath) {
+\ttry {
+\t\tconst cached = JSON.parse(readFileSync(cachePath, "utf8"));
+\t\tif (cached?.version !== 1) return void 0;
+\t\treturn {
+\t\t\tgeneration: typeof cached.generation === "string" ? cached.generation : void 0,
+\t\t\tbase: typeof cached.base === "string" && cached.base !== "" ? cached.base : void 0
+\t\t};
+\t} catch {
+\t\treturn void 0;
+\t}
+}
+function detectTraeCnEnterpriseBase() {
+\tconst override = (process.env["PI_TRAE_CN_CHAT_BASE"] ?? "").trim();
+\tif (override !== "") return override.replace(/\\/+$/, "");
+\tconst cachePath = traeCnGatewayCachePath();
+\tconst cached = readTraeCnGatewayCache(cachePath);
+\tconst sessions = traeCnLogSessions();
+\tconst generation = sessions[0]?.mainLog;
+\t// One scan per IDE session. The log of a running session cannot gain a second
+\t// tenant, and the next IDE start writes a new session directory — which is
+\t// also the moment a freshly signed-in account's \`HostInfo\` lands. So a cache
+\t// hit can never hide an account switch, and a personal-account start does not
+\t// re-read its (possibly huge) session logs on every Pi launch.
+\tif (generation !== void 0 && cached?.generation === generation) return cached.base;
+\tif (generation === void 0) return cached?.base;
+\tlet base;
+\tfor (const session of sessions) {
+\t\tlet text;
+\t\ttry {
+\t\t\ttext = readFileSync(session.mainLog, "utf8");
+\t\t} catch {
+\t\t\tcontinue;
+\t\t}
+\t\tbase = traeCnHostInfoHost(text);
+\t\tif (base !== void 0) break;
+\t}
+\t// A rotated log must not drop a known tenant host — the public gateway answers
+\t// 4008 for that seat. A scan that does find a host always wins, so switching
+\t// tenants is picked up from the new session's log.
+\tconst remembered = base ?? cached?.base;
+\ttry {
+\t\tmkdirSync(dirname(cachePath), { recursive: true });
+\t\twriteFileSync(cachePath, JSON.stringify({
+\t\t\tversion: 1,
+\t\t\tgeneration,
+\t\t\tbase: remembered ?? null,
+\t\t\tsavedAt: Date.now()
+\t\t}, null, 2), "utf8");
+\t} catch {
+\t\t// A failed cache write only costs a log scan next start.
+\t}
+\treturn remembered;
+}
+const TRAE_CN_ENTERPRISE_BASE = detectTraeCnEnterpriseBase();
+if (TRAE_CN_ENTERPRISE_BASE !== void 0) {
+\tREGION_GATEWAYS.cn.chat = TRAE_CN_ENTERPRISE_BASE;
+\tREGION_GATEWAYS.cn.remote = \`\${TRAE_CN_ENTERPRISE_BASE}/api/remote/v1\`;
+}`;
+text = text.replace(ENT_REGION_ANCHOR, `${ENT_REGION_ANCHOR}\n${ENT_GATEWAY_BLOCK}`);
+
+const SOLO_BODY_ANCHOR = '\t\tstream: true,\n\t\t...Array.isArray(input["tools"])';
+if (text.split(SOLO_BODY_ANCHOR).length !== 2) throw new Error("prepareSoloBody stream anchor not found");
+text = text.replace(
+  SOLO_BODY_ANCHOR,
+  [
+    "\t\tstream: true,",
+    "\t\t// The enterprise (tenant) gateway rejects a body without these with",
+    '\t\t// `4001 "param is invalid"`; the public gateway tolerates their absence.',
+    "\t\t// The IDE always sends both (see buildTraeAgentTaskBody above).",
+    '\t\trequest_id: typeof input["request_id"] === "string" && input["request_id"] !== "" ? input["request_id"] : randomUUID(),',
+    '\t\tsession_id: typeof input["session_id"] === "string" && input["session_id"] !== "" ? input["session_id"] : randomUUID(),',
+    '\t\t...Array.isArray(input["tools"])',
+  ].join("\n"),
+);
+
+const STREAM_STATE_ANCHOR = "\tlet upstreamEnded = false;\n\tlet upstreamError;\n\tlet usage;";
+if (text.split(STREAM_STATE_ANCHOR).length !== 2) throw new Error("bridge stream state anchor not found");
+text = text.replace(
+  STREAM_STATE_ANCHOR,
+  [
+    STREAM_STATE_ANCHOR,
+    "\t/**",
+    "\t* Turn an upstream failure into an OpenAI-style error frame.",
+    "\t*",
+    "\t* An upstream error (quota exhausted, decoding failure, transport reset) must",
+    "\t* never be pushed into the response stream with `controller.error()`: if that",
+    "\t* happens before the consumer attaches, Bun treats the stream rejection as an",
+    "\t* unhandled promise rejection and takes the whole Pi process down. The frame",
+    "\t* below is surfaced by Pi as an ordinary model error instead, so the session",
+    "\t* survives and the user sees the upstream message.",
+    "\t*/",
+    "\tconst errorFrame = (error) => encoder.encode(`data: ${JSON.stringify({ error: {",
+    "\t\tmessage: error.message,",
+    '\t\ttype: "trae_upstream_error"',
+    "\t} })}\\n\\ndata: [DONE]\\n\\n`);",
+  ].join("\n"),
+);
+
+const UPSTREAM_STREAM_ERROR_RE = /^(\t+)controller\.error\(upstreamError\);$/gm;
+if (text.match(UPSTREAM_STREAM_ERROR_RE)?.length !== 2) throw new Error("controller.error(upstreamError) sites not found");
+text = text.replace(
+  UPSTREAM_STREAM_ERROR_RE,
+  "$1controller.enqueue(errorFrame(upstreamError));\n$1controller.close();",
+);
+const CATCH_ERROR_RE = /^(\t+)controller\.error\(error\);$/gm;
+if (text.match(CATCH_ERROR_RE)?.length !== 1) throw new Error("catch controller.error site not found");
+text = text.replace(
+  CATCH_ERROR_RE,
+  [
+    "$1try {",
+    "$1\tcontroller.enqueue(errorFrame(error instanceof Error ? error : new Error(String(error))));",
+    "$1\tcontroller.close();",
+    "$1} catch {",
+    "$1\t// Stream already closed by the consumer; nothing left to report.",
+    "$1}",
+  ].join("\n"),
+);
+if (text.includes("controller.error(upstreamError)") || /controller\.error\(error\);/.test(text)) throw new Error("controller.error still present");
+
 // --- 5. Strip the DSH-only regions, keep the protocol core + usage/check-in logic ---
 // Kept: everything through `src/web-status.ts` (usage client, check-in status,
 // credit/check-in projection helpers used by the Pi commands).
@@ -326,6 +552,7 @@ const out = [
   "  TraeSoloRemoteCatalogClient,",
   "  TraeSoloUpstreamClient,",
   "  REGION_GATEWAYS,",
+  "  TRAE_CN_ENTERPRISE_BASE,",
   "  SseDecoder,",
   "  TRAE_AI_PROVIDER,",
   "  TRAE_CN_AGENT_TASK_PATH,",

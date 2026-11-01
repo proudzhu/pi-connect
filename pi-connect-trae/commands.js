@@ -16,6 +16,7 @@
  */
 import {
   CHECKIN_DEVICE_ALREADY_CLAIMED,
+  TRAE_CN_ENTERPRISE_BASE,
   TraeUsageClient,
   safeMessage,
   toCheckin,
@@ -72,7 +73,14 @@ async function usageForRegion(stack, logger) {
     }
     const snapshot = await client.snapshot();
     const checkin = await client.checkinStatus();
-    return `${label} (${credential.accountName ?? credential.userId}):\n${renderCredits(toCredits(snapshot))}\n  签到: ${renderCheckin(toCheckin(checkin))}`;
+    // An enterprise (tenant) seat bills against the enterprise console; the
+    // credit packs read here are the personal ones and are empty for such a
+    // seat. Say so instead of letting "0 可用" look like a broken account.
+    const enterpriseNote =
+      TRAE_CN_ENTERPRISE_BASE === undefined
+        ? ""
+        : `\n  企业版: 请求走租户网关 ${TRAE_CN_ENTERPRISE_BASE}，额度由企业控制台管理；以上为个人额度包，可能显示为 0`;
+    return `${label} (${credential.accountName ?? credential.userId}):\n${renderCredits(toCredits(snapshot))}\n  签到: ${renderCheckin(toCheckin(checkin))}${enterpriseNote}`;
   } catch (error) {
     return `${label}: 读取失败 - ${safeMessage(error)}`;
   }

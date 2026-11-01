@@ -23,7 +23,7 @@
 Pi 模型运行时（openai-completions API）
   -> 回环 shim（127.0.0.1 随机端口 + 进程内随机 secret）
   -> Trae SOLO 协议（llm_utils_chat / get_detail_param）
-  -> CN https://trae-api-cn.mchost.guru / 国际 https://coresg-normal.trae.ai
+  -> CN https://trae-api-cn.mchost.guru（企业版：自动探测到租户网关）/ 国际 https://coresg-normal.trae.ai
 ```
 
 ## 命令
@@ -56,8 +56,42 @@ pi install npm:@citie114514/pi-connect-trae
 | 环境变量 | 作用 |
 | --- | --- |
 | `TRAE_AUTH_FILE` | 覆盖 `storage.json` 路径（可选） |
+| `PI_TRAE_CN_CHAT_BASE` | 强制指定国内版网关（企业版租户用，见下节） |
 
 插件自有刷新后的凭据副本存放在 `~/.pi/agent/cache/dsh-connect-trae/`（原 DSH 版放在 DSH home）。
+
+## 企业版（企业租户）账号
+
+企业版 TRAE CN 席位**不走公共网关**。公共网关 `trae-api-cn.mchost.guru` 只看个人额度包，
+企业席位的个人包是空的，所以不管企业控制台里还有多少额度，每个请求都回
+`event:error {"code":4008,"message":"Your requests have exceeded the quota."}`。
+企业账号实际走租户网关：登录响应的 `HostInfo` 里 `Api`/`Core` = `https://console.enterprise.trae.cn`，
+`SoloDomain` = `https://work.enterprise.trae.cn`（实测租户）。
+
+插件在 import 时按下列顺序解析租户网关，解析到就把 `REGION_GATEWAYS.cn.chat/remote` 覆写掉：
+
+1. 环境变量 `PI_TRAE_CN_CHAT_BASE`（最高优先级，直接覆盖）
+2. TRAE CN 桌面版最新的 `logs/<会话>/main.log` 里的 `"HostInfo"` 块
+   （取最近 4 个会话，匹配 `Api`/`Core`/`Console`/`SoloDomain` 中形如 `enterprise.trae.*` 的地址）
+3. 缓存 `~/.pi/agent/cache/dsh-connect-trae/gateway-cn.json`
+   （日志被轮转或清理后兜底，避免静默回落公共网关又撞 4008）
+4. 都没有 → 公共网关，个人账号行为不变
+
+扫描只在**每个 IDE 会话**里做一次：会话目录名（`logs/20261026T083754` 这种）就是日志的「代」，
+同一个会话的日志里不可能出现第二个租户，而下次启动 IDE 会写新目录 —— 也正是重新登录、
+`HostInfo` 被重写的时候。所以缓存不会掩盖换租户，个人账号也不会每次启动 pi 都重读日志。
+
+个人账号无需任何配置。注意已探测到的租户网关是**粘性**的（日志被清掉也不会自己退回公共网关，
+否则企业席位就静默 4008 了）。从企业账号换成个人账号、或换到别的租户时，删掉上面的缓存文件，
+或者直接设环境变量：
+
+```powershell
+setx PI_TRAE_CN_CHAT_BASE "https://console.enterprise.trae.cn"
+```
+
+租户网关的两处额外要求已一并处理：SOLO 请求体必须带 `request_id`/`session_id`
+（缺失会回 `4001 "param is invalid"`，缺省时自动生成），并且 `/trae-usage` 会在检测到企业网关时
+提示「额度由企业控制台管理，个人额度包可能显示为 0」。
 
 ## 使用
 
@@ -73,6 +107,11 @@ pi --provider trae --model DeepSeek-V4-Flash-Official --print "你好"
   `modelsReady` 永不复位，进程存活期间不会再看上游的新增/下线。
 - **目录并发刷新单飞。** 多个请求或「请求 + 显式刷新」同时到达时共用同一趟发现，
   既不会重复拉取，也不会让晚返回的旧结果覆盖新目录。
+- **上游报错不再让 Pi 闪退。** 原 bundle 把上游错误用 `controller.error()` 推进响应流；
+  在 Bun 下这会变成 unhandled rejection，直接杀掉整个 Pi 进程。现在改为输出一帧
+  OpenAI 风格的 `{"error":{"message":…,"type":"trae_upstream_error"}}` + `[DONE]`，
+  Pi 把它当普通模型错误呈现，会话存活。
+- **企业版（企业租户）网关自动探测**，见上节。
 - **部分发现不丢弃可用模型。** Trae 的目录分散在多个 function 下。某个 function 失败
   （HTTP 5xx、超时，或该账号本就无权访问某个模式）时，其余 function 返回的模型照常启用，
   只是不推进 TTL，下一个请求会重试补齐；只有全部失败才保留上一份目录。此前任一 function
