@@ -8,7 +8,8 @@
 | `dsh-connect-trae` v2.3.1 | `trae`、`trae-global` | 国内版 / 国际版 Trae 并行 |
 
 本仓库（`pi-connect`）是一个 npm workspaces 单仓库，产出两个可发布到 npm 的 Pi 扩展包
-（`@citie114514/pi-connect-qoder`、`@citie114514/pi-connect-trae`）。
+（`@citie114514/pi-connect-qoder`、`@citie114514/pi-connect-trae`），另含一个本地的
+**OMP（oh-my-pi）适配包** `omp-connect-trae/`（不发 npm，见「OMP 宿主」一节）。
 
 
 ## 工作原理
@@ -52,6 +53,9 @@ pi-connect/                            (仓库根：npm workspaces)
 │  ├─ README.md           包说明
 │  ├─ THIRD_PARTY_NOTICES.md  上游 MIT 归属
 │  └─ lib/trae-core.js    从 DSH bundle 手术提取的协议核心
+├─ omp-connect-trae/     OMP（oh-my-pi）适配包（本地 link，不发 npm）
+│  ├─ index.js            OMP 扩展入口：捕获 Pi provider 对象 -> OMP registerProvider(name, config)
+│  └─ package.json        omp.extensions 清单
 ├─ cyrene/ide-account-bridge/    昔涟（Cyrene）宿主版（见下方说明）
 │  ├─ src/entry.js         插件入口：register / unregister / open，IPC + 三个 Agent 工具
 │  ├─ src/endpoints.js     回环端点持久化（端口 + bearer token，跨重启稳定）
@@ -95,6 +99,43 @@ pi install npm:@citie114514/pi-connect-trae
 
 > **两种方式二选一**：`extensions/` 目录直接安装与 `pi install`（写入 settings.json）同时使用会让
 > 供应商注册两次。
+
+### OMP（oh-my-pi）宿主
+
+OMP 是 Pi 的分支，但 provider 注册接口不同：
+
+| 宿主 | 接口 |
+| --- | --- |
+| Pi | `pi.registerProvider(providerObject)` |
+| OMP | `pi.registerProvider(name, config)` |
+
+直接把 `pi-connect-trae` 加载进 OMP 会在注册时崩溃：
+`TypeError: undefined is not an object (evaluating 'p.streamSimple')` —— Pi 的 provider 对象被当成
+OMP 的 `name`，`config` 为 `undefined`。`omp-connect-trae/` 是适配层：用 Proxy 跑 Pi 工厂并捕获
+provider 对象，逐个区域调用 `auth.apiKey.resolve()` 启动回环 shim，再用 OMP 的
+`registerProvider(name, { baseUrl, apiKey, api: "openai-completions", models })` 重新注册；
+`/trae-usage`、`/trae-checkin` 一并可用。
+
+```powershell
+omp plugin install ~/.pi/packages/pi-connect/omp-connect-trae
+# 或者不装插件，直接把目录加进 ~/.omp/agent/config.yml：
+# extensions:
+#   - ~/.pi/packages/pi-connect/omp-connect-trae
+
+omp plugin list                        # ● omp-connect-trae@1.0.0
+omp models                             # trae (N)
+omp -p "Reply with exactly: ok" --model trae/DeepSeek-V4.1-Flash
+```
+
+注意：
+
+- OMP 的 provider 配置没有「按请求注入 baseUrl/token」的钩子，所以适配层只能在注册前解析区域。
+  每次启动都要解析一次 shim（缓存命中约 2–3 秒，首次模型目录发现可能更久）。这与 Pi 侧
+  「factory 不开 socket」的约定不同，是 OMP 静态配置的必然代价。
+- 只注册已登录的区域：本机只有国内版登录时只出现 `trae`，`trae-global` 不出现。
+- 适配层用相对路径引用 `../pi-connect-trae/index.js`，升级只需 `git pull` 本仓库克隆。
+- 不要同时保留其他独立的 trae 适配文件（如 `~/.omp/agent/extensions/*trae*.js`），否则会注册两次。
+
 
 ### 发布到 Pi 官方包画廊（pi.dev/packages）
 
@@ -175,6 +216,9 @@ Pi 官方 `docs/extensions.md` 要求：**不要在扩展 factory 里启动 sock
 
 实测：`pi --list-models` 期间 **0 个 socket**（日志无 `ready:`），会话内才启动 3 个 shim。
 
+> OMP 适配层（`omp-connect-trae/`）不适用这条约定：OMP 的静态 provider 配置没有按请求注入
+> baseUrl/token 的钩子，必须在注册前解析区域并启动 shim。原因与代价见上文「OMP 宿主」。
+
 
 ## 命令
 
@@ -220,6 +264,9 @@ OpenAI 兼容档案（`contextWindowTokens` 手填）。
   167/300 与今日可领 100 credits；
 - `trae-global` 本机无国际版登录，正确跳过；`qoder`（国际版）上游偶发 `provider_error` 为该账号额度/网关问题（与 DSH 插件 README 记录的已知行为一致），非移植缺陷。
 - `npm pack` 产物解包后单独加载，14+2+4 模型全部注册、对话正常。
+- OMP（oh-my-pi 18.18.3）：`omp plugin install` link `omp-connect-trae` 后，`omp models` 列出
+  `trae (21)`；`omp -p "Reply with exactly: ok" --model trae/DeepSeek-V4.1-Flash` 实测返回 `ok`
+  （走适配层注册的回环 shim）。直接加载 Pi 包则复现 `p.streamSimple` 崩溃，故必须有适配层。
 
 ## 与 DSH 版本的差异
 

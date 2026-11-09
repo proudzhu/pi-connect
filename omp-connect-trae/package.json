@@ -1,0 +1,16 @@
+{
+  "name": "omp-connect-trae",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OMP (oh-my-pi) adapter for pi-connect-trae: registers the locally signed-in Trae (CN / Global) accounts as OMP model providers.",
+  "type": "module",
+  "license": "MIT",
+  "omp": {
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*"
+  }
+}
